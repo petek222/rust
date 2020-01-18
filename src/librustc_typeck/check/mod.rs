@@ -80,6 +80,7 @@ mod expr;
 mod generator_interior;
 pub mod intrinsic;
 pub mod method;
+mod never_compat;
 mod op;
 mod pat;
 mod regionck;
@@ -135,6 +136,7 @@ use syntax::util::parser::ExprPrecedence;
 
 use rustc_error_codes::*;
 
+use std::borrow::Cow;
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::cmp;
 use std::collections::hash_map::Entry;
@@ -253,6 +255,14 @@ pub struct Inherited<'a, 'tcx> {
     /// environment is for an item or something where the "callee" is
     /// not clear.
     implicit_region_bound: Option<ty::Region<'tcx>>,
+
+    /// Maps each expression with a generic path
+    /// (e.g. `foo::<u8>()` to `InferredPath` containing
+    /// additional information used by `NeverCompatHandler`.
+    ///
+    /// Each entry in this map is gradually filled in during typecheck,
+    /// as the information we need is not available all at once.
+    inferred_paths: RefCell<FxHashMap<hir::HirId, InferredPath<'tcx>>>,
 
     body_id: Option<hir::BodyId>,
 }
@@ -619,6 +629,48 @@ pub struct FnCtxt<'a, 'tcx> {
     inh: &'a Inherited<'a, 'tcx>,
 }
 
+/// Stores additional data about a generic path
+/// containing inference variables (e.g. `my_method::<_, u8>(bar)`).
+/// This is used by `NeverCompatHandler` to inspect
+/// all method calls that contain inference variables.
+///
+/// This struct is a little strange, in that its data
+/// is filled in from two different places in typecheck.
+/// Thw two `Option` fields are written by `check_argument_types`
+/// and `instantiate_value_path`, since neither method
+/// has all of the information it needs.
+#[derive(Clone, Debug)]
+struct InferredPath<'tcx> {
+    /// The span of the corresponding expression.
+    span: Span,
+    /// The type of this path. For method calls,
+    /// this is a `ty::FnDef`
+    ty: Option<Ty<'tcx>>,
+    /// The types of the arguments (*not* generic substs)
+    /// provided to this path, if it represents a method
+    /// call. For example, `foo(true, 25)` would have
+    /// types `[bool, i32]`. If this path does not
+    /// correspond to a method, then this will be `None`
+    ///
+    /// This is a `Cow` rather than a `Vec` or slice
+    /// to accommodate `check_argument_types`, which may
+    /// be called with either an interned slice or a Vec.
+    /// A `Cow` lets us avoid unecessary interning
+    /// and Vec construction, since we just need to iterate
+    /// over this
+    args: Option<Cow<'tcx, [Ty<'tcx>]>>,
+    /// The unresolved inference variables for each
+    /// generic substs. Each entry in the outer vec
+    /// corresponds to a generic substs in the function.
+    ///
+    /// For example, suppose we have the function
+    /// `fn foo<T, V> (){ ... }`.
+    ///
+    /// The method call `foo::<MyStruct<_#0t, #1t>, true>>()`
+    /// will have an `unresolved_vars` of `[[_#0t, _#1t], []]`
+    unresolved_vars: Vec<Vec<Ty<'tcx>>>,
+}
+
 impl<'a, 'tcx> Deref for FnCtxt<'a, 'tcx> {
     type Target = Inherited<'a, 'tcx>;
     fn deref(&self) -> &Self::Target {
@@ -685,6 +737,7 @@ impl Inherited<'a, 'tcx> {
             opaque_types: RefCell::new(Default::default()),
             opaque_types_vars: RefCell::new(Default::default()),
             implicit_region_bound,
+            inferred_paths: RefCell::new(Default::default()),
             body_id,
         }
     }
@@ -1053,6 +1106,7 @@ fn typeck_tables_of_with_fallback<'tcx>(
         // All type checking constraints were added, try to fallback unsolved variables.
         fcx.select_obligations_where_possible(false, |_| {});
         let mut fallback_has_occurred = false;
+        let never_compat = never_compat::NeverCompatHandler::pre_fallback(&fcx);
 
         // We do fallback in two passes, to try to generate
         // better error messages.
@@ -1094,6 +1148,8 @@ fn typeck_tables_of_with_fallback<'tcx>(
 
         // See if we can make any more progress.
         fcx.select_obligations_where_possible(fallback_has_occurred, |_| {});
+
+        never_compat.post_fallback(&fcx);
 
         // Even though coercion casts provide type hints, we check casts after fallback for
         // backwards compatibility. This makes fallback a stronger type hint than a cast coercion.
@@ -3618,7 +3674,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self.check_argument_types(
                 sp,
                 expr,
-                &err_inputs[..],
+                err_inputs,
                 &[],
                 args_no_rcvr,
                 false,
@@ -3726,13 +3782,39 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         sp: Span,
         expr: &'tcx hir::Expr<'tcx>,
-        fn_inputs: &[Ty<'tcx>],
+        fn_inputs: impl Into<Cow<'tcx, [Ty<'tcx>]>>,
         expected_arg_tys: &[Ty<'tcx>],
         args: &'tcx [hir::Expr<'tcx>],
         c_variadic: bool,
         tuple_arguments: TupleArgumentsFlag,
         def_span: Option<Span>,
     ) {
+        let fn_inputs = fn_inputs.into();
+        debug!("check_argument_types: storing arguments for expr {:?}", expr);
+        // We now have the arguments types available for this msthod call,
+        // so store them in the `inferred_paths` entry for this method call.
+        // We set `ty` as `None` if we are the first to access the entry
+        // for this method, and leave it untouched otherwise.
+        match self.inferred_paths.borrow_mut().entry(expr.hir_id) {
+            Entry::Vacant(e) => {
+                debug!("check_argument_types: making new entry for types {:?}", fn_inputs);
+                e.insert(InferredPath {
+                    span: sp,
+                    ty: None,
+                    args: Some(fn_inputs.clone()),
+                    unresolved_vars: vec![],
+                });
+            }
+            Entry::Occupied(mut e) => {
+                debug!(
+                    "check_argument_types: modifying existing {:?} with types {:?}",
+                    e.get(),
+                    fn_inputs
+                );
+                e.get_mut().args = Some(fn_inputs.clone());
+            }
+        }
+
         let tcx = self.tcx;
         // Grab the argument types, supplying fresh type variables
         // if the wrong number of arguments were supplied
@@ -5418,6 +5500,39 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Substitute the values for the type parameters into the type of
         // the referenced item.
         let ty_substituted = self.instantiate_type_scheme(span, &substs, &ty);
+
+        if ty_substituted.has_infer_types() {
+            debug!(
+                "instantiate_value_path: saving path with infer: ({:?}, {:?})",
+                span, ty_substituted
+            );
+            let parent_id = tcx.hir().get_parent_node(hir_id);
+            let parent = tcx.hir().get(parent_id);
+            match parent {
+                Node::Expr(hir::Expr { span: p_span, kind: ExprKind::Call(..), .. })
+                | Node::Expr(hir::Expr { span: p_span, kind: ExprKind::MethodCall(..), .. }) => {
+                    // Fill in the type for our parent expression. This might not be
+                    // a method call - if it is, the argumetns will be filled in by
+                    // `check_argument_types`
+                    match self.inferred_paths.borrow_mut().entry(parent_id) {
+                        Entry::Vacant(e) => {
+                            debug!("instantiate_value_path: inserting new path");
+                            e.insert(InferredPath {
+                                span: *p_span,
+                                ty: Some(ty_substituted),
+                                args: None,
+                                unresolved_vars: vec![],
+                            });
+                        }
+                        Entry::Occupied(mut e) => {
+                            debug!("instantiate_value_path: updating existing path {:?}", e.get());
+                            e.get_mut().ty = Some(ty_substituted);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
 
         if let Some(UserSelfTy { impl_def_id, self_ty }) = user_self_ty {
             // In the case of `Foo<T>::method` and `<Foo<T>>::method`, if `method`
